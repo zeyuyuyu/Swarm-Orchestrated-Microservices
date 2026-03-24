@@ -1,112 +1,133 @@
+import socket
 import time
 import json
-import logging
+import threading
 from typing import Dict, List, Optional
-import requests
-from dataclasses import dataclass
+import logging
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+class ServiceRegistry:
+    def __init__(self):
+        self._services: Dict[str, List[Dict]] = {}
+        self._lock = threading.Lock()
+        self._health_check_interval = 30  # seconds
+        self._start_health_checker()
+        
+        logging.basicConfig(level=logging.INFO)
+        self.logger = logging.getLogger(__name__)
 
-@dataclass
-class ServiceNode:
-    name: str
-    host: str
-    port: int
-    health_endpoint: str
-    last_health_check: float
-    healthy: bool = True
-    retry_count: int = 0
-
-class ServiceDiscovery:
-    def __init__(self, health_check_interval: int = 30):
-        self.services: Dict[str, List[ServiceNode]] = {}
-        self.health_check_interval = health_check_interval
-        self.max_retries = 3
-    
-    def register_service(self, name: str, host: str, port: int, 
-                        health_endpoint: str = '/health') -> None:
-        if name not in self.services:
-            self.services[name] = []
+    def register_service(self, service_name: str, host: str, port: int, metadata: Optional[Dict] = None) -> bool:
+        """Register a new service instance"""
+        with self._lock:
+            if service_name not in self._services:
+                self._services[service_name] = []
             
-        service = ServiceNode(
-            name=name,
-            host=host,
-            port=port,
-            health_endpoint=health_endpoint,
-            last_health_check=time.time()
-        )
-        self.services[name].append(service)
-        logger.info(f'Registered service {name} at {host}:{port}')
-
-    def deregister_service(self, name: str, host: str, port: int) -> None:
-        if name in self.services:
-            self.services[name] = [s for s in self.services[name] 
-                                 if not (s.host == host and s.port == port)]
-            logger.info(f'Deregistered service {name} at {host}:{port}')
-
-    def get_healthy_service(self, name: str) -> Optional[ServiceNode]:
-        if name not in self.services:
-            return None
+            service_info = {
+                'host': host,
+                'port': port,
+                'metadata': metadata or {},
+                'last_check': time.time(),
+                'healthy': True
+            }
             
-        healthy_services = [s for s in self.services[name] if s.healthy]
-        if not healthy_services:
-            return None
-            
-        # Simple round-robin selection among healthy services
-        return healthy_services[int(time.time()) % len(healthy_services)]
+            self._services[service_name].append(service_info)
+            self.logger.info(f'Registered new service: {service_name} at {host}:{port}')
+            return True
 
-    def check_service_health(self, service: ServiceNode) -> bool:
+    def get_service(self, service_name: str) -> Optional[Dict]:
+        """Get a healthy service instance using round-robin selection"""
+        with self._lock:
+            if service_name not in self._services:
+                return None
+            
+            # Filter healthy instances
+            healthy_instances = [
+                instance for instance in self._services[service_name]
+                if instance['healthy']
+            ]
+            
+            if not healthy_instances:
+                return None
+            
+            # Round-robin selection
+            instance = healthy_instances[0]
+            self._services[service_name].append(
+                self._services[service_name].pop(0)
+            )
+            
+            return {
+                'host': instance['host'],
+                'port': instance['port'],
+                'metadata': instance['metadata']
+            }
+
+    def _health_check(self) -> None:
+        """Perform health check on all registered services"""
+        while True:
+            with self._lock:
+                for service_name, instances in self._services.items():
+                    for instance in instances:
+                        healthy = self._check_instance_health(
+                            instance['host'],
+                            instance['port']
+                        )
+                        
+                        instance['healthy'] = healthy
+                        instance['last_check'] = time.time()
+                        
+                        if not healthy:
+                            self.logger.warning(
+                                f'Service {service_name} at {instance["host"]}:{instance["port"]} '
+                                f'is unhealthy'
+                            )
+                        
+            time.sleep(self._health_check_interval)
+
+    def _check_instance_health(self, host: str, port: int) -> bool:
+        """Check if a service instance is healthy using TCP connection"""
         try:
-            url = f'http://{service.host}:{service.port}{service.health_endpoint}'
-            response = requests.get(url, timeout=5)
-            healthy = response.status_code == 200
-            
-            if healthy:
-                service.retry_count = 0
-                service.healthy = True
-            else:
-                self._handle_unhealthy_service(service)
-                
-            service.last_health_check = time.time()
-            return healthy
-            
-        except requests.exceptions.RequestException:
-            self._handle_unhealthy_service(service)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(2)
+            result = sock.connect_ex((host, port))
+            sock.close()
+            return result == 0
+        except:
             return False
 
-    def _handle_unhealthy_service(self, service: ServiceNode) -> None:
-        service.retry_count += 1
-        if service.retry_count >= self.max_retries:
-            service.healthy = False
-            logger.warning(f'Service {service.name} at {service.host}:{service.port} '
-                         f'marked as unhealthy after {self.max_retries} retries')
-            self._trigger_recovery(service)
+    def _start_health_checker(self) -> None:
+        """Start the health checker in a background thread"""
+        health_thread = threading.Thread(
+            target=self._health_check,
+            daemon=True
+        )
+        health_thread.start()
 
-    def _trigger_recovery(self, service: ServiceNode) -> None:
-        logger.info(f'Attempting recovery for service {service.name} at '
-                   f'{service.host}:{service.port}')
-        # Here you would implement service recovery logic
-        # For example: restart container, notify admin, scale new instance, etc.
-
-    def health_check_loop(self) -> None:
-        while True:
-            for service_list in self.services.values():
-                for service in service_list:
-                    if (time.time() - service.last_health_check) >= self.health_check_interval:
-                        self.check_service_health(service)
-            time.sleep(1)
-
-    def get_service_status(self) -> Dict:
-        status = {}
-        for service_name, service_list in self.services.items():
-            status[service_name] = [
-                {
-                    'host': s.host,
-                    'port': s.port,
-                    'healthy': s.healthy,
-                    'last_check': s.last_health_check,
-                    'retry_count': s.retry_count
-                } for s in service_list
+    def deregister_service(self, service_name: str, host: str, port: int) -> bool:
+        """Deregister a service instance"""
+        with self._lock:
+            if service_name not in self._services:
+                return False
+            
+            self._services[service_name] = [
+                instance for instance in self._services[service_name]
+                if not (instance['host'] == host and instance['port'] == port)
             ]
-        return status
+            
+            self.logger.info(f'Deregistered service: {service_name} at {host}:{port}')
+            return True
+
+    def get_all_services(self) -> Dict[str, List[Dict]]:
+        """Get all registered services and their status"""
+        with self._lock:
+            return {
+                name: [
+                    {
+                        'host': instance['host'],
+                        'port': instance['port'],
+                        'metadata': instance['metadata'],
+                        'healthy': instance['healthy'],
+                        'last_check': instance['last_check']
+                    }
+                    for instance in instances
+                ]
+                for name, instances in self._services.items()
+            }
